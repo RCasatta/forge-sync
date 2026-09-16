@@ -37,6 +37,14 @@ item progress. A successful incremental snapshot remains usable while this
 background reconciliation spans multiple rate-limit windows; `status` reports
 whether reconciliation is still in progress.
 
+GitLab synchronization prints sanitized page and item progress to stderr,
+including the collection name and its final record/page counts. Each
+individual `glab api` subprocess has a 30-second timeout. An MR may retain a
+reference to a pipeline that GitLab has deleted or made inaccessible; a 404 for
+that optional pipeline detail is recorded in `pipeline.json` as
+`{"id": ID, "unavailable": "not_found"}`. A 404 for required project, issue,
+or merge-request resources remains fatal.
+
 `status` never uses the network. It returns nonzero for incomplete or
 inconsistent data and reports the last completed timestamp. It deliberately
 does not impose an age limit: consuming projects decide freshness requirements

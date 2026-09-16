@@ -1,11 +1,18 @@
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::manifest::RateLimit;
 use crate::{Error, Result};
+
+const GLAB_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn is_not_found(diagnostic: &str) -> bool {
+    diagnostic.contains("HTTP 404")
+}
 
 pub trait GitlabApi {
     fn get(&mut self, endpoint: &str) -> Result<Value>;
@@ -80,9 +87,23 @@ impl GitlabApi for GlabClient {
             }
             Ok::<_, std::io::Error>(bounded)
         });
-        let status = child
-            .wait()
-            .map_err(|_| Error::Remote("waiting for glab failed".to_owned()))?;
+        let deadline = Instant::now() + GLAB_TIMEOUT;
+        let (status, timed_out) = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| Error::Remote("waiting for glab failed".to_owned()))?
+            {
+                break (status, false);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let status = child
+                    .wait()
+                    .map_err(|_| Error::Remote("terminating timed-out glab failed".to_owned()))?;
+                break (status, true);
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
         let stdout = out_thread
             .join()
             .map_err(|_| Error::Remote("reading glab output failed".to_owned()))?
@@ -91,8 +112,16 @@ impl GitlabApi for GlabClient {
             .join()
             .map_err(|_| Error::Remote("reading glab diagnostic failed".to_owned()))?
             .map_err(|_| Error::Remote("reading glab diagnostic failed".to_owned()))?;
+        if timed_out {
+            return Err(Error::Remote(
+                "glab request timed out after 30 seconds".to_owned(),
+            ));
+        }
         if !status.success() {
             let diagnostic = String::from_utf8_lossy(&stderr);
+            if is_not_found(&diagnostic) {
+                return Err(Error::RemoteNotFound);
+            }
             let first_line: String = diagnostic
                 .lines()
                 .next()
@@ -149,5 +178,12 @@ mod tests {
         for forbidden in ["--method", "-X", "--field", "--raw-field"] {
             assert!(!command.args.iter().any(|arg| arg == forbidden));
         }
+    }
+
+    #[test]
+    fn recognizes_only_http_404_as_not_found() {
+        assert!(is_not_found("glab: 404 Not found (HTTP 404)"));
+        assert!(!is_not_found("glab: 403 Forbidden (HTTP 403)"));
+        assert_eq!(GLAB_TIMEOUT, Duration::from_secs(30));
     }
 }

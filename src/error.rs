@@ -18,6 +18,8 @@ pub enum Error {
     Json { context: String },
     #[error("remote request failed: {0}")]
     Remote(String),
+    #[error("remote resource was not found")]
+    RemoteNotFound,
     #[error("GitHub rate limit is too low to continue safely (remaining: {0})")]
     RateLimited(u32),
     #[error("cache is inconsistent: {0}")]

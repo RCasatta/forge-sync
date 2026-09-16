@@ -647,12 +647,34 @@ fn github_bootstrap<A: GithubApi>(
 
 fn gitlab_collection<A: GitlabApi>(
     api: &mut A,
+    description: &str,
     endpoint: &str,
     manifest: &mut Manifest,
 ) -> Result<Vec<Value>> {
-    let (items, pages) = fetch_pages(api, endpoint, |api, page| api.get(page))?;
+    let mut current_page = 0_u64;
+    let (items, pages) = fetch_pages(api, endpoint, |api, page| {
+        current_page += 1;
+        eprintln!("forge-sync: gitlab: fetching {description}, page {current_page}");
+        api.get(page)
+    })?;
     manifest.pages_completed += pages;
+    let page_word = if pages == 1 { "page" } else { "pages" };
+    eprintln!(
+        "forge-sync: gitlab: completed {description}: {} records across {pages} {page_word}",
+        items.len()
+    );
     Ok(items)
+}
+
+fn gitlab_pipeline_result(result: Result<Value>, pipeline_id: u64) -> Result<Value> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(Error::RemoteNotFound) => Ok(serde_json::json!({
+            "id": pipeline_id,
+            "unavailable": "not_found"
+        })),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn gitlab<A: GitlabApi>(host: &str, project: &str, output: &Path, api: &mut A) -> Result<()> {
@@ -699,35 +721,44 @@ fn gitlab_inner<A: GitlabApi>(
     store.atomic_write_json("project.json", &metadata)?;
     let open_issues = gitlab_collection(
         api,
+        "open issues",
         &format!("{prefix}/issues?state=opened&order_by=updated_at&sort=desc"),
         manifest,
     )?;
     let open_mrs = gitlab_collection(
         api,
+        "open merge requests",
         &format!("{prefix}/merge_requests?state=opened&order_by=updated_at&sort=desc"),
         manifest,
     )?;
-    let cursor_query = manifest
-        .cursor
-        .used
-        .map(|cursor| {
-            format!(
-                "&updated_after={}",
-                cursor.to_rfc3339_opts(SecondsFormat::Secs, true)
+    let (cursor_query, changed_issues_description, changed_mrs_description) =
+        if let Some(cursor) = manifest.cursor.used {
+            let cursor = cursor.to_rfc3339_opts(SecondsFormat::Secs, true);
+            (
+                format!("&updated_after={cursor}"),
+                format!("issues updated since {cursor}"),
+                format!("merge requests updated since {cursor}"),
             )
-        })
-        .unwrap_or_default();
+        } else {
+            (
+                String::new(),
+                "all issues ordered by update time".to_owned(),
+                "all merge requests ordered by update time".to_owned(),
+            )
+        };
     let changed_issues = gitlab_collection(
         api,
+        &changed_issues_description,
         &format!("{prefix}/issues?scope=all&order_by=updated_at&sort=asc{cursor_query}"),
         manifest,
     )?;
     let changed_mrs = gitlab_collection(
         api,
+        &changed_mrs_description,
         &format!("{prefix}/merge_requests?scope=all&order_by=updated_at&sort=asc{cursor_query}"),
         manifest,
     )?;
-    let todos = gitlab_collection(api, "todos?state=pending", manifest)?;
+    let todos = gitlab_collection(api, "pending todos", "todos?state=pending", manifest)?;
     let todos: Vec<_> = todos
         .into_iter()
         .filter(|todo| todo.pointer("/project/id").and_then(Value::as_u64) == Some(project_id))
@@ -740,7 +771,7 @@ fn gitlab_inner<A: GitlabApi>(
     merge_items(&mut mrs, open_mrs.iter().cloned());
     merge_items(&mut mrs, changed_mrs.iter().cloned());
     let mut index: Vec<IndexItem> = Vec::new();
-    for (id, item) in &issues {
+    for (position, (id, item)) in issues.iter().enumerate() {
         let base = format!("issues/{id}");
         if detail_needs_refresh(
             store,
@@ -754,21 +785,33 @@ fn gitlab_inner<A: GitlabApi>(
                 "resource-label-events",
             ],
         ) {
+            eprintln!(
+                "forge-sync: gitlab: refreshing issue {}/{}, IID {id}",
+                position + 1,
+                issues.len()
+            );
             store.create_dir(&base)?;
             let detail = api.get(&format!("{prefix}/issues/{id}"))?;
             store.atomic_write_json(format!("{base}/issue.json"), &detail)?;
-            for (name, endpoint) in [
-                ("discussions", format!("{prefix}/issues/{id}/discussions")),
+            for (name, description, endpoint) in [
+                (
+                    "discussions",
+                    "discussions",
+                    format!("{prefix}/issues/{id}/discussions"),
+                ),
                 (
                     "resource-state-events",
+                    "state events",
                     format!("{prefix}/issues/{id}/resource_state_events"),
                 ),
                 (
                     "resource-label-events",
+                    "label events",
                     format!("{prefix}/issues/{id}/resource_label_events"),
                 ),
             ] {
-                let values = gitlab_collection(api, &endpoint, manifest)?;
+                let description = format!("issue IID {id} {description}");
+                let values = gitlab_collection(api, &description, &endpoint, manifest)?;
                 store.atomic_write_json(format!("{base}/{name}.json"), &values)?;
             }
         }
@@ -784,7 +827,7 @@ fn gitlab_inner<A: GitlabApi>(
             index.push(item);
         }
     }
-    for (id, item) in &mrs {
+    for (position, (id, item)) in mrs.iter().enumerate() {
         let base = format!("merge-requests/{id}");
         let mut source = item.clone();
         if detail_needs_refresh(
@@ -801,20 +844,31 @@ fn gitlab_inner<A: GitlabApi>(
                 "pipeline",
             ],
         ) {
+            eprintln!(
+                "forge-sync: gitlab: refreshing merge request {}/{}, IID {id}",
+                position + 1,
+                mrs.len()
+            );
             store.create_dir(&base)?;
             let detail = api.get(&format!("{prefix}/merge_requests/{id}"))?;
             source = detail.clone();
             store.atomic_write_json(format!("{base}/merge-request.json"), &detail)?;
             let approvals = api.get(&format!("{prefix}/merge_requests/{id}/approvals"))?;
             store.atomic_write_json(format!("{base}/approvals.json"), &approvals)?;
-            for (name, endpoint) in [
+            for (name, description, endpoint) in [
                 (
+                    "discussions",
                     "discussions",
                     format!("{prefix}/merge_requests/{id}/discussions"),
                 ),
-                ("commits", format!("{prefix}/merge_requests/{id}/commits")),
+                (
+                    "commits",
+                    "commits",
+                    format!("{prefix}/merge_requests/{id}/commits"),
+                ),
             ] {
-                let values = gitlab_collection(api, &endpoint, manifest)?;
+                let description = format!("merge request IID {id} {description}");
+                let values = gitlab_collection(api, &description, &endpoint, manifest)?;
                 store.atomic_write_json(format!("{base}/{name}.json"), &values)?;
             }
             let changes = api.get(&format!("{prefix}/merge_requests/{id}/changes"))?;
@@ -822,7 +876,10 @@ fn gitlab_inner<A: GitlabApi>(
             let pipeline = if let Some(pipeline_id) =
                 detail.pointer("/head_pipeline/id").and_then(Value::as_u64)
             {
-                api.get(&format!("{prefix}/pipelines/{pipeline_id}"))?
+                gitlab_pipeline_result(
+                    api.get(&format!("{prefix}/pipelines/{pipeline_id}")),
+                    pipeline_id,
+                )?
             } else {
                 Value::Null
             };
@@ -1214,5 +1271,18 @@ mod tests {
         assert!(status(temp.path())
             .unwrap()
             .contains("reconciliation in progress"));
+    }
+
+    #[test]
+    fn missing_gitlab_pipeline_becomes_an_explicit_marker() {
+        let marker = gitlab_pipeline_result(Err(Error::RemoteNotFound), 491_567).unwrap();
+        assert_eq!(
+            marker,
+            serde_json::json!({"id": 491567, "unavailable": "not_found"})
+        );
+        assert!(matches!(
+            gitlab_pipeline_result(Err(Error::Remote("failure".to_owned())), 1),
+            Err(Error::Remote(_))
+        ));
     }
 }
