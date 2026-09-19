@@ -403,7 +403,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn rejects_world_accessible_and_unsupported_root_modes() {
-        for unsupported in [0o701, 0o740, 0o755, 0o2750] {
+        for unsupported in [0o701, 0o710, 0o740, 0o755] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("cache");
             fs::create_dir(&root).unwrap();
