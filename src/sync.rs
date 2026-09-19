@@ -981,6 +981,16 @@ mod tests {
     use crate::manifest::RateLimit;
     use std::collections::VecDeque;
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        temp
+    }
+
     struct FakeGithub {
         responses: VecDeque<Value>,
         requests: u64,
@@ -1026,7 +1036,7 @@ mod tests {
             serde_json::json!({"check_runs":[]}),
             Value::Array(vec![]),
         ]);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let mut api = FakeGithub {
             responses: std::mem::take(&mut responses),
             requests: 0,
@@ -1055,7 +1065,7 @@ mod tests {
 
     #[test]
     fn failed_run_does_not_advance_cursor() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let mut api = FakeGithub {
             responses: VecDeque::new(),
             requests: 0,
@@ -1083,7 +1093,7 @@ mod tests {
             requests: 0,
             endpoints: Vec::new(),
         };
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         github("owner/repo", temp.path(), &mut first).unwrap();
         let store = Store::open_existing(temp.path().to_owned()).unwrap();
         let old_snapshot: Vec<Value> = store.read_json("open-issues.json").unwrap().unwrap();
@@ -1107,7 +1117,7 @@ mod tests {
 
     #[test]
     fn reconciliation_forces_complete_bundle_refresh() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let store = Store::open(temp.path().join("cache")).unwrap();
         for file in ["issue", "comments", "events"] {
             store
@@ -1138,7 +1148,7 @@ mod tests {
     #[test]
     fn completed_cache_syncs_changes_first_without_open_enumeration() {
         let issue = serde_json::json!({"id": 1, "number": 1, "title":"i", "state":"open", "updated_at":"2025-01-01T00:00:00Z"});
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let mut initial = FakeGithub {
             responses: VecDeque::from(vec![
                 Value::Array(vec![issue.clone()]),
@@ -1200,7 +1210,7 @@ mod tests {
                 })
             })
             .collect();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let mut first = RateScript {
             first_page: Some(Value::Array(items)),
             endpoints: Vec::new(),
@@ -1241,7 +1251,7 @@ mod tests {
             "id": 1, "number": 1, "title": "i", "state": "open",
             "updated_at": "2025-01-01T00:00:00Z"
         });
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let mut initial = FakeGithub {
             responses: VecDeque::from(vec![
                 Value::Array(vec![issue.clone()]),

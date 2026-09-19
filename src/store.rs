@@ -15,7 +15,19 @@ const SENTINEL: &str = "PRIVATE FORGE CACHE\nThis directory may contain private 
 
 pub struct Store {
     root: PathBuf,
+    permissions: CachePermissions,
 }
+
+#[derive(Clone, Copy)]
+struct CachePermissions {
+    directory: u32,
+    file: u32,
+}
+
+const PRIVATE_PERMISSIONS: CachePermissions = CachePermissions {
+    directory: 0o700,
+    file: 0o600,
+};
 
 pub struct Lock {
     file: File,
@@ -30,8 +42,22 @@ impl Drop for Lock {
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self> {
         validate_absolute_no_symlinks(&root)?;
-        create_private_dir_all(&root)?;
-        let store = Self { root };
+        let permissions = if root.exists() {
+            if !root.is_dir() {
+                return Err(Error::Inconsistent(
+                    "output path is not a directory".to_owned(),
+                ));
+            }
+            cache_permissions(&root)?
+        } else {
+            create_dir_all_with_mode(&root, PRIVATE_PERMISSIONS.directory)?;
+            let permissions = cache_permissions(&root)?;
+            if permissions.directory != PRIVATE_PERMISSIONS.directory {
+                return Err(unsupported_cache_permissions(&root, permissions.directory));
+            }
+            PRIVATE_PERMISSIONS
+        };
+        let store = Self { root, permissions };
         store.atomic_write_bytes(Path::new("README-PRIVATE.txt"), SENTINEL.as_bytes())?;
         Ok(store)
     }
@@ -43,7 +69,8 @@ impl Store {
                 "output directory does not exist".to_owned(),
             ));
         }
-        Ok(Self { root })
+        let permissions = cache_permissions(&root)?;
+        Ok(Self { root, permissions })
     }
 
     pub fn root(&self) -> &Path {
@@ -53,14 +80,14 @@ impl Store {
     pub fn lock(&self) -> Result<Lock> {
         let path = self.root.join(".forge-sync.lock");
         reject_symlink(&path)?;
-        let file = private_open(&path)?;
+        let file = open_with_mode(&path, self.permissions.file)?;
         file.try_lock_exclusive().map_err(|_| Error::Locked)?;
         Ok(Lock { file })
     }
 
     pub fn create_dir(&self, relative: impl AsRef<Path>) -> Result<()> {
         let path = self.safe_path(relative.as_ref())?;
-        create_private_dir_all(&path)
+        create_dir_all_with_mode(&path, self.permissions.directory)
     }
 
     pub fn exists(&self, relative: impl AsRef<Path>) -> bool {
@@ -104,13 +131,13 @@ impl Store {
             path: path.clone(),
             reason: "missing parent".to_owned(),
         })?;
-        create_private_dir_all(parent)?;
+        create_dir_all_with_mode(parent, self.permissions.directory)?;
         validate_absolute_no_symlinks(parent)?;
         reject_symlink(&path)?;
         let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp = parent.join(format!(".forge-sync-{}-{id}.tmp", std::process::id()));
         let result = (|| {
-            let mut file = private_create_new(&temp)?;
+            let mut file = create_new_with_mode(&temp, self.permissions.file)?;
             file.write_all(data)
                 .map_err(io(format!("writing {}", temp.display())))?;
             file.sync_all()
@@ -201,7 +228,7 @@ fn reject_symlink(path: &Path) -> Result<()> {
     }
 }
 
-fn create_private_dir_all(path: &Path) -> Result<()> {
+fn create_dir_all_with_mode(path: &Path, mode: u32) -> Result<()> {
     let mut missing = Vec::new();
     let mut cursor = path;
     while !cursor.exists() {
@@ -214,77 +241,193 @@ fn create_private_dir_all(path: &Path) -> Result<()> {
     validate_absolute_no_symlinks(cursor)?;
     for dir in missing.iter().rev() {
         fs::create_dir(dir).map_err(io(format!("creating {}", dir.display())))?;
-        set_dir_mode(dir)?;
+        set_mode(dir, mode)?;
     }
     validate_absolute_no_symlinks(path)
 }
 
 #[cfg(unix)]
-fn set_dir_mode(path: &Path) -> Result<()> {
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .map_err(io(format!("setting permissions on {}", path.display())))
 }
 
 #[cfg(not(unix))]
-fn set_dir_mode(_path: &Path) -> Result<()> {
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn private_open(path: &Path) -> Result<File> {
+#[cfg(unix)]
+fn set_file_mode(file: &File, path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(io(format!("setting permissions on {}", path.display())))
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_file: &File, _path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cache_permissions(path: &Path) -> Result<CachePermissions> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path).map_err(io(format!("inspecting {}", path.display())))?;
+    let directory = metadata.permissions().mode() & 0o7777;
+    match directory {
+        0o700 | 0o750 | 0o770 => {}
+        _ => return Err(unsupported_cache_permissions(path, directory)),
+    }
+    let file = directory & 0o660;
+    Ok(CachePermissions { directory, file })
+}
+
+#[cfg(not(unix))]
+fn cache_permissions(_path: &Path) -> Result<CachePermissions> {
+    Ok(PRIVATE_PERMISSIONS)
+}
+
+fn unsupported_cache_permissions(path: &Path, mode: u32) -> Error {
+    Error::Inconsistent(format!(
+        "cache root {} has unsupported permissions {mode:04o}; expected 0700, 0750, or 0770",
+        path.display()
+    ))
+}
+
+fn open_with_mode(path: &Path, mode: u32) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(mode);
     }
-    options
+    let file = options
         .open(path)
-        .map_err(io(format!("opening {}", path.display())))
+        .map_err(io(format!("opening {}", path.display())))?;
+    set_file_mode(&file, path, mode)?;
+    Ok(file)
 }
 
-fn private_create_new(path: &Path) -> Result<File> {
+fn create_new_with_mode(path: &Path, mode: u32) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(mode);
     }
-    options
+    let file = options
         .open(path)
-        .map_err(io(format!("creating {}", path.display())))
+        .map_err(io(format!("creating {}", path.display())))?;
+    set_file_mode(&file, path, mode)?;
+    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn mode(path: impl AsRef<Path>) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn set_test_mode(path: impl AsRef<Path>, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     #[test]
     #[cfg(unix)]
     fn private_and_atomic_and_rejects_symlinks() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("cache");
         let store = Store::open(root.clone()).unwrap();
         store
             .atomic_write_json("nested/value.json", &serde_json::json!({"x": 1}))
             .unwrap();
-        assert_eq!(
-            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(root.join("nested/value.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        let _lock = store.lock().unwrap();
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(root.join("nested")), 0o700);
+        assert_eq!(mode(root.join("nested/value.json")), 0o600);
+        assert_eq!(mode(root.join("README-PRIVATE.txt")), 0o600);
+        assert_eq!(mode(root.join(".forge-sync.lock")), 0o600);
         symlink(temp.path(), root.join("bad")).unwrap();
         assert!(store.atomic_write_json("bad/oops.json", &1).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn derives_group_readable_permissions_from_existing_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("cache");
+        fs::create_dir(&root).unwrap();
+        set_test_mode(&root, 0o750);
+
+        let store = Store::open(root.clone()).unwrap();
+        store.atomic_write_json("one/two/value.json", &1).unwrap();
+        let _lock = store.lock().unwrap();
+
+        assert_eq!(mode(&root), 0o750);
+        assert_eq!(mode(root.join("one")), 0o750);
+        assert_eq!(mode(root.join("one/two")), 0o750);
+        assert_eq!(mode(root.join("one/two/value.json")), 0o640);
+        assert_eq!(mode(root.join("README-PRIVATE.txt")), 0o640);
+        assert_eq!(mode(root.join(".forge-sync.lock")), 0o640);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn derives_group_writable_permissions_and_atomic_replacement_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("cache");
+        fs::create_dir(&root).unwrap();
+        set_test_mode(&root, 0o770);
+
+        let store = Store::open(root.clone()).unwrap();
+        store.atomic_write_json("nested/value.json", &1).unwrap();
+        set_test_mode(root.join("nested/value.json"), 0o600);
+        store.atomic_write_json("nested/value.json", &2).unwrap();
+
+        assert_eq!(mode(root.join("nested")), 0o770);
+        assert_eq!(mode(root.join("nested/value.json")), 0o660);
+        assert_eq!(mode(root.join("README-PRIVATE.txt")), 0o660);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rejects_world_accessible_and_unsupported_root_modes() {
+        for unsupported in [0o701, 0o740, 0o755, 0o2750] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("cache");
+            fs::create_dir(&root).unwrap();
+            set_test_mode(&root, unsupported);
+            assert!(matches!(Store::open(root), Err(Error::Inconsistent(_))));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn does_not_change_existing_nested_directory_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("cache");
+        let existing = root.join("existing");
+        fs::create_dir(&root).unwrap();
+        set_test_mode(&root, 0o750);
+        fs::create_dir(&existing).unwrap();
+        set_test_mode(&existing, 0o700);
+
+        let store = Store::open(root).unwrap();
+        store.atomic_write_json("existing/value.json", &1).unwrap();
+
+        assert_eq!(mode(&existing), 0o700);
+        assert_eq!(mode(existing.join("value.json")), 0o640);
     }
 
     #[test]

@@ -12,9 +12,35 @@ forge-sync status <ABSOLUTE_OUTPUT_DIRECTORY>
 ```
 
 Arguments have exact arity. Provider identifiers are validated before any I/O,
-and destinations must be absolute paths without symlink components. Cache files
-are private (`0600`, directories `0700`) and replaced atomically. Each cache has
-a warning sentinel because it may contain private material.
+and destinations must be absolute paths without symlink components. A cache root
+created by `forge-sync` is private (`0700` directories and `0600` files). For a
+pre-existing root, its mode configures permissions for newly created content:
+
+| Cache root | New directories | New and atomically replaced files |
+| --- | --- | --- |
+| `0700` | `0700` | `0600` |
+| `0750` | `0750` | `0640` |
+| `0770` | `0770` | `0660` |
+
+For example:
+
+```sh
+# Private cache
+install -d -m 0700 /path/to/cache
+
+# Group-readable cache
+install -d -m 0750 /path/to/cache
+
+# Group-readable and group-writable cache
+install -d -m 0770 /path/to/cache
+```
+
+Other modes are rejected, including any mode granting access to “other”. The
+selected mode applies to lock files, the warning sentinel, manifests, JSON files,
+and atomic replacements. Existing nested directories are not recursively
+changed. The cache can contain private project data, so any group given access
+must be trusted. Syncthing can synchronize Unix permission bits; the receiving
+user must also belong to the applicable local group for group access to work.
 
 Synchronization writes an in-progress manifest before requests begin and only
 advances the cursor after the changed-item query and its required detail data
