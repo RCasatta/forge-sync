@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,69 @@ use crate::model::{index_item, number, updated_at, IndexItem};
 use crate::pagination::collect_pages;
 use crate::store::Store;
 use crate::{Error, Result};
+
+const GITLAB_ISSUE_FILES: &[&str] = &[
+    "issue",
+    "discussions",
+    "resource-state-events",
+    "resource-label-events",
+];
+const GITLAB_MR_FILES: &[&str] = &[
+    "merge-request",
+    "approvals",
+    "discussions",
+    "commits",
+    "changes",
+    "pipeline",
+];
+
+fn log_sync_started(manifest: &Manifest) {
+    let mode = if manifest.last_complete_at.is_some() {
+        "incremental"
+    } else {
+        "bootstrap"
+    };
+    let reconciliation = if manifest.reconciliation_in_progress {
+        ", reconciliation due"
+    } else {
+        ""
+    };
+    eprintln!(
+        "forge-sync: {}: starting {} ({mode}{reconciliation})",
+        manifest.provider, manifest.identity
+    );
+}
+
+fn log_sync_completed(manifest: &Manifest, elapsed: Duration) {
+    let review_kind = if manifest.provider == "github" {
+        "pulls"
+    } else {
+        "merge requests"
+    };
+    let reconciliation = if manifest.reconciliation_in_progress {
+        ", reconciliation pending"
+    } else {
+        ""
+    };
+    let rate_limit = manifest
+        .rate_limit
+        .as_ref()
+        .and_then(|rate| rate.remaining.zip(rate.limit))
+        .map(|(remaining, limit)| format!(", GitHub rate limit {remaining}/{limit}"))
+        .unwrap_or_default();
+    eprintln!(
+        "forge-sync: {}: completed {} in {:.1}s: {} open issues, {} open {review_kind}, {} changed issues, {} changed {review_kind}, {} requests, {} pages{rate_limit}{reconciliation}",
+        manifest.provider,
+        manifest.identity,
+        elapsed.as_secs_f64(),
+        manifest.counts.open_issues,
+        manifest.counts.open_reviews,
+        manifest.counts.changed_issues,
+        manifest.counts.changed_reviews,
+        manifest.requests_completed,
+        manifest.pages_completed,
+    );
+}
 
 fn prior_manifest(store: &Store, provider: &str, identity: &str) -> Result<Option<Manifest>> {
     let prior: Option<Manifest> = store.read_json("manifest.json")?;
@@ -186,6 +250,7 @@ fn github_refresh_item<A: GithubApi>(
         context: "GitHub item number".to_owned(),
     })?;
     if item.get("pull_request").is_none() {
+        eprintln!("forge-sync: github: refreshing issue #{id}");
         let base = format!("issues/{id}");
         store.create_dir(&base)?;
         let detail = api.get(&format!("/repos/{repo}/issues/{id}"))?;
@@ -204,6 +269,7 @@ fn github_refresh_item<A: GithubApi>(
         return Ok(());
     }
 
+    eprintln!("forge-sync: github: refreshing pull request #{id}");
     let base = format!("pulls/{id}");
     store.create_dir(&base)?;
     let detail = api.get(&format!("/repos/{repo}/pulls/{id}"))?;
@@ -328,6 +394,7 @@ fn publish_github(
 }
 
 pub fn github<A: GithubApi>(repository: &str, output: &Path, api: &mut A) -> Result<()> {
+    let started = Instant::now();
     let store = Store::open(output.to_owned())?;
     let _lock = store.lock()?;
     let previous = prior_manifest(&store, "github", repository)?;
@@ -335,6 +402,7 @@ pub fn github<A: GithubApi>(repository: &str, output: &Path, api: &mut A) -> Res
     manifest.unsupported_resources.push(
         "GitHub Discussions require authenticated GraphQL and are not synchronized".to_owned(),
     );
+    log_sync_started(&manifest);
     store.atomic_write_json("manifest.json", &manifest)?;
     let result = api
         .prime_rate_limit()
@@ -344,7 +412,9 @@ pub fn github<A: GithubApi>(repository: &str, output: &Path, api: &mut A) -> Res
     match result {
         Ok(()) => {
             manifest.complete(Utc::now());
-            store.atomic_write_json("manifest.json", &manifest)
+            store.atomic_write_json("manifest.json", &manifest)?;
+            log_sync_completed(&manifest, started.elapsed());
+            Ok(())
         }
         Err(error) => {
             if matches!(error, Error::RateLimited(_)) {
@@ -388,6 +458,14 @@ fn github_incremental<A: GithubApi>(
     })?;
     let (changed, delta_started) =
         github_incremental_delta(repository, repo, store, api, manifest, cursor)?;
+    let changed_pulls = changed
+        .iter()
+        .filter(|item| item.get("pull_request").is_some())
+        .count();
+    eprintln!(
+        "forge-sync: github: {repository}: found {} changed issues and {changed_pulls} changed pull requests",
+        changed.len() - changed_pulls
+    );
 
     let mut open = BTreeMap::new();
     let issues: Vec<Value> = store
@@ -420,6 +498,10 @@ fn github_incremental_delta<A: GithubApi>(
     manifest: &mut Manifest,
     since: DateTime<Utc>,
 ) -> Result<(Vec<Value>, DateTime<Utc>)> {
+    eprintln!(
+        "forge-sync: github: {repository}: scanning changes since {}",
+        since.to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
     let prior: Option<GithubDelta> = store.read_json("github-delta.json")?;
     let can_resume = prior.as_ref().is_some_and(|progress| {
         progress.schema_version == 1 && progress.repository == repository && progress.since == since
@@ -437,7 +519,6 @@ fn github_incremental_delta<A: GithubApi>(
             items: BTreeMap::new(),
         }
     };
-
     let endpoint = |page| {
         format!(
             "/repos/{repo}/issues?state=all&sort=updated&direction=desc&since={}&per_page=100&page={page}",
@@ -453,6 +534,11 @@ fn github_incremental_delta<A: GithubApi>(
             context: "GitHub incremental newest page".to_owned(),
         })?;
         merge_items(&mut progress.items, page.iter().cloned());
+        eprintln!(
+            "forge-sync: github: {repository}: resumed change scan found {} items on newest page ({} total)",
+            page.len(),
+            progress.items.len()
+        );
         store.atomic_write_json("github-delta.json", &progress)?;
         for item in newest_first(page.iter().cloned()) {
             github_refresh_item(repo, store, api, manifest, &item, false)?;
@@ -511,6 +597,11 @@ fn github_reconcile<A: GithubApi>(
             completed: BTreeSet::new(),
         }
     };
+    eprintln!(
+        "forge-sync: github: {repository}: reconciliation has {} open items discovered, {} completed",
+        progress.items.len(),
+        progress.completed.len()
+    );
     // Preserve items that move across page boundaries while reconciliation runs,
     // and remove state transitions observed by the successful incremental pass.
     apply_github_changes(&mut progress.items, changed);
@@ -535,6 +626,12 @@ fn github_reconcile<A: GithubApi>(
             context: "GitHub reconciliation open-item page".to_owned(),
         })?;
         merge_items(&mut progress.items, page.iter().cloned());
+        eprintln!(
+            "forge-sync: github: {repository}: reconciliation page {} found {} items ({} total)",
+            progress.next_page,
+            page.len(),
+            progress.items.len()
+        );
         progress.next_page += 1;
         progress.reached_end = page.len() < 100;
         store.atomic_write_json("github-reconciliation.json", &progress)?;
@@ -576,6 +673,11 @@ fn github_bootstrap<A: GithubApi>(
             "GitHub bootstrap state does not match command".to_owned(),
         ));
     }
+    eprintln!(
+        "forge-sync: github: {repository}: bootstrap at page {}, {} open items discovered",
+        progress.next_page,
+        progress.items.len()
+    );
 
     // On resumed runs, catch up recent activity before spending requests on old pages.
     if progress.next_page > 1 || progress.reached_end {
@@ -613,6 +715,12 @@ fn github_bootstrap<A: GithubApi>(
             context: "GitHub bootstrap open-item page".to_owned(),
         })?;
         merge_items(&mut progress.items, page.iter().cloned());
+        eprintln!(
+            "forge-sync: github: {repository}: bootstrap page {} found {} items ({} total)",
+            progress.next_page,
+            page.len(),
+            progress.items.len()
+        );
         progress.next_page += 1;
         progress.reached_end = page.len() < 100;
         store.atomic_write_json("github-bootstrap.json", &progress)?;
@@ -647,22 +755,11 @@ fn github_bootstrap<A: GithubApi>(
 
 fn gitlab_collection<A: GitlabApi>(
     api: &mut A,
-    description: &str,
     endpoint: &str,
     manifest: &mut Manifest,
 ) -> Result<Vec<Value>> {
-    let mut current_page = 0_u64;
-    let (items, pages) = fetch_pages(api, endpoint, |api, page| {
-        current_page += 1;
-        eprintln!("forge-sync: gitlab: fetching {description}, page {current_page}");
-        api.get(page)
-    })?;
+    let (items, pages) = fetch_pages(api, endpoint, |api, page| api.get(page))?;
     manifest.pages_completed += pages;
-    let page_word = if pages == 1 { "page" } else { "pages" };
-    eprintln!(
-        "forge-sync: gitlab: completed {description}: {} records across {pages} {page_word}",
-        items.len()
-    );
     Ok(items)
 }
 
@@ -678,11 +775,13 @@ fn gitlab_pipeline_result(result: Result<Value>, pipeline_id: u64) -> Result<Val
 }
 
 pub fn gitlab<A: GitlabApi>(host: &str, project: &str, output: &Path, api: &mut A) -> Result<()> {
+    let started = Instant::now();
     let identity = format!("{host}/{project}");
     let store = Store::open(output.to_owned())?;
     let _lock = store.lock()?;
     let previous = prior_manifest(&store, "gitlab", &identity)?;
     let mut manifest = Manifest::started("gitlab", &identity, previous.as_ref(), Utc::now());
+    log_sync_started(&manifest);
     store.atomic_write_json("manifest.json", &manifest)?;
     let result = gitlab_inner(project, &store, api, &mut manifest);
     manifest.requests_completed = api.requests();
@@ -693,7 +792,9 @@ pub fn gitlab<A: GitlabApi>(host: &str, project: &str, output: &Path, api: &mut 
                 manifest.reconciliation_in_progress = false;
             }
             manifest.complete(Utc::now());
-            store.atomic_write_json("manifest.json", &manifest)
+            store.atomic_write_json("manifest.json", &manifest)?;
+            log_sync_completed(&manifest, started.elapsed());
+            Ok(())
         }
         Err(error) => {
             manifest.fail(&error.to_string());
@@ -721,48 +822,47 @@ fn gitlab_inner<A: GitlabApi>(
     store.atomic_write_json("project.json", &metadata)?;
     let open_issues = gitlab_collection(
         api,
-        "open issues",
         &format!("{prefix}/issues?state=opened&order_by=updated_at&sort=desc"),
         manifest,
     )?;
     let open_mrs = gitlab_collection(
         api,
-        "open merge requests",
         &format!("{prefix}/merge_requests?state=opened&order_by=updated_at&sort=desc"),
         manifest,
     )?;
-    let (cursor_query, changed_issues_description, changed_mrs_description) =
-        if let Some(cursor) = manifest.cursor.used {
-            let cursor = cursor.to_rfc3339_opts(SecondsFormat::Secs, true);
-            (
-                format!("&updated_after={cursor}"),
-                format!("issues updated since {cursor}"),
-                format!("merge requests updated since {cursor}"),
+    let cursor_query = manifest
+        .cursor
+        .used
+        .map(|cursor| {
+            format!(
+                "&updated_after={}",
+                cursor.to_rfc3339_opts(SecondsFormat::Secs, true)
             )
-        } else {
-            (
-                String::new(),
-                "all issues ordered by update time".to_owned(),
-                "all merge requests ordered by update time".to_owned(),
-            )
-        };
+        })
+        .unwrap_or_default();
     let changed_issues = gitlab_collection(
         api,
-        &changed_issues_description,
         &format!("{prefix}/issues?scope=all&order_by=updated_at&sort=asc{cursor_query}"),
         manifest,
     )?;
     let changed_mrs = gitlab_collection(
         api,
-        &changed_mrs_description,
         &format!("{prefix}/merge_requests?scope=all&order_by=updated_at&sort=asc{cursor_query}"),
         manifest,
     )?;
-    let todos = gitlab_collection(api, "pending todos", "todos?state=pending", manifest)?;
+    let todos = gitlab_collection(api, "todos?state=pending", manifest)?;
     let todos: Vec<_> = todos
         .into_iter()
         .filter(|todo| todo.pointer("/project/id").and_then(Value::as_u64) == Some(project_id))
         .collect();
+    eprintln!(
+        "forge-sync: gitlab: {project}: scan found {} open issues, {} open merge requests, {} changed issues, {} changed merge requests, {} pending todos",
+        open_issues.len(),
+        open_mrs.len(),
+        changed_issues.len(),
+        changed_mrs.len(),
+        todos.len()
+    );
 
     let mut issues = BTreeMap::new();
     merge_items(&mut issues, open_issues.iter().cloned());
@@ -770,105 +870,77 @@ fn gitlab_inner<A: GitlabApi>(
     let mut mrs = BTreeMap::new();
     merge_items(&mut mrs, open_mrs.iter().cloned());
     merge_items(&mut mrs, changed_mrs.iter().cloned());
+    let issue_refresh_total = issues
+        .values()
+        .filter(|item| detail_needs_refresh(store, "issues", item, manifest, GITLAB_ISSUE_FILES))
+        .count();
+    let mr_refresh_total = mrs
+        .values()
+        .filter(|item| {
+            detail_needs_refresh(store, "merge-requests", item, manifest, GITLAB_MR_FILES)
+        })
+        .count();
+    eprintln!(
+        "forge-sync: gitlab: {project}: refreshing {issue_refresh_total}/{} issue bundles and {mr_refresh_total}/{} merge-request bundles",
+        issues.len(),
+        mrs.len()
+    );
+    let mut issues_refreshed = 0_usize;
+    let mut mrs_refreshed = 0_usize;
     let mut index: Vec<IndexItem> = Vec::new();
-    for (position, (id, item)) in issues.iter().enumerate() {
+    for (id, item) in &issues {
         let base = format!("issues/{id}");
-        if detail_needs_refresh(
-            store,
-            "issues",
-            item,
-            manifest,
-            &[
-                "issue",
-                "discussions",
-                "resource-state-events",
-                "resource-label-events",
-            ],
-        ) {
-            eprintln!(
-                "forge-sync: gitlab: refreshing issue {}/{}, IID {id}",
-                position + 1,
-                issues.len()
-            );
+        if detail_needs_refresh(store, "issues", item, manifest, GITLAB_ISSUE_FILES) {
             store.create_dir(&base)?;
             let detail = api.get(&format!("{prefix}/issues/{id}"))?;
             store.atomic_write_json(format!("{base}/issue.json"), &detail)?;
-            for (name, description, endpoint) in [
-                (
-                    "discussions",
-                    "discussions",
-                    format!("{prefix}/issues/{id}/discussions"),
-                ),
+            for (name, endpoint) in [
+                ("discussions", format!("{prefix}/issues/{id}/discussions")),
                 (
                     "resource-state-events",
-                    "state events",
                     format!("{prefix}/issues/{id}/resource_state_events"),
                 ),
                 (
                     "resource-label-events",
-                    "label events",
                     format!("{prefix}/issues/{id}/resource_label_events"),
                 ),
             ] {
-                let description = format!("issue IID {id} {description}");
-                let values = gitlab_collection(api, &description, &endpoint, manifest)?;
+                let values = gitlab_collection(api, &endpoint, manifest)?;
                 store.atomic_write_json(format!("{base}/{name}.json"), &values)?;
             }
+            issues_refreshed += 1;
+            if issues_refreshed.is_multiple_of(25) || issues_refreshed == issue_refresh_total {
+                eprintln!(
+                    "forge-sync: gitlab: {project}: refreshed {issues_refreshed}/{issue_refresh_total} issue bundles (latest IID {id})"
+                );
+            }
         }
-        let paths = [
-            "issue",
-            "discussions",
-            "resource-state-events",
-            "resource-label-events",
-        ]
-        .map(|name| format!("{base}/{name}.json"))
-        .to_vec();
+        let paths = GITLAB_ISSUE_FILES
+            .iter()
+            .map(|name| format!("{base}/{name}.json"))
+            .collect();
         if let Some(item) = index_item("gitlab", "issue", item, paths) {
             index.push(item);
         }
     }
-    for (position, (id, item)) in mrs.iter().enumerate() {
+    for (id, item) in &mrs {
         let base = format!("merge-requests/{id}");
         let mut source = item.clone();
-        if detail_needs_refresh(
-            store,
-            "merge-requests",
-            item,
-            manifest,
-            &[
-                "merge-request",
-                "approvals",
-                "discussions",
-                "commits",
-                "changes",
-                "pipeline",
-            ],
-        ) {
-            eprintln!(
-                "forge-sync: gitlab: refreshing merge request {}/{}, IID {id}",
-                position + 1,
-                mrs.len()
-            );
+        if detail_needs_refresh(store, "merge-requests", item, manifest, GITLAB_MR_FILES) {
             store.create_dir(&base)?;
             let detail = api.get(&format!("{prefix}/merge_requests/{id}"))?;
             source = detail.clone();
             store.atomic_write_json(format!("{base}/merge-request.json"), &detail)?;
             let approvals = api.get(&format!("{prefix}/merge_requests/{id}/approvals"))?;
             store.atomic_write_json(format!("{base}/approvals.json"), &approvals)?;
-            for (name, description, endpoint) in [
+            for (name, endpoint) in [
                 (
-                    "discussions",
                     "discussions",
                     format!("{prefix}/merge_requests/{id}/discussions"),
                 ),
-                (
-                    "commits",
-                    "commits",
-                    format!("{prefix}/merge_requests/{id}/commits"),
-                ),
+                ("commits", format!("{prefix}/merge_requests/{id}/commits")),
             ] {
-                let description = format!("merge request IID {id} {description}");
-                let values = gitlab_collection(api, &description, &endpoint, manifest)?;
+                let values = gitlab_collection(api, &endpoint, manifest)?;
                 store.atomic_write_json(format!("{base}/{name}.json"), &values)?;
             }
             let changes = api.get(&format!("{prefix}/merge_requests/{id}/changes"))?;
@@ -884,21 +956,21 @@ fn gitlab_inner<A: GitlabApi>(
                 Value::Null
             };
             store.atomic_write_json(format!("{base}/pipeline.json"), &pipeline)?;
+            mrs_refreshed += 1;
+            if mrs_refreshed.is_multiple_of(10) || mrs_refreshed == mr_refresh_total {
+                eprintln!(
+                    "forge-sync: gitlab: {project}: refreshed {mrs_refreshed}/{mr_refresh_total} merge-request bundles (latest IID {id})"
+                );
+            }
         } else if let Some(detail) =
             store.read_json::<Value>(format!("{base}/merge-request.json"))?
         {
             source = detail;
         }
-        let paths = [
-            "merge-request",
-            "approvals",
-            "discussions",
-            "commits",
-            "changes",
-            "pipeline",
-        ]
-        .map(|name| format!("{base}/{name}.json"))
-        .to_vec();
+        let paths = GITLAB_MR_FILES
+            .iter()
+            .map(|name| format!("{base}/{name}.json"))
+            .collect();
         if let Some(item) = index_item("gitlab", "merge-request", &source, paths) {
             index.push(item);
         }
