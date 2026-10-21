@@ -52,7 +52,14 @@ In `counts`, `open_reviews` means GitHub pull requests or GitLab merge requests;
 
 ## `index.json`
 
-`index.json` is an array of normalized current open items. Each object contains:
+`index.json` is an array of normalized items: every current open item plus
+every item in `changed-items.json`. Changed items may already be closed or
+merged, so consumers that want only open items must filter on `state`
+(GitHub `open`; GitLab `opened`). Entries are sorted by `kind`, then `number`.
+GitHub pull-request and GitLab merge-request entries are built from the
+stored detail file (`pull.json` / `merge-request.json`) when present; issue
+entries are built from the list representation. Each
+object contains:
 
 | Field | Meaning |
 | --- | --- |
@@ -80,13 +87,24 @@ the raw files referenced by `raw_paths`.
 - `index.json`: normalized current open-item discovery index.
 - `open-issues.json`: raw current open issues.
 - `changed-items.json`: raw items changed during the successful incremental
-  window; it may include items that are now closed or merged.
+  window; it may include items that are now closed or merged. On a first
+  GitLab synchronization there is no cursor yet, so it contains every issue
+  and merge request of the project regardless of state. On a first GitHub
+  synchronization it contains only items updated since the bootstrap
+  started (with a five-minute overlap).
 - `README-PRIVATE.txt`: warning that the cache may contain private material.
 - `.forge-sync.lock`: synchronization lock; consumers must ignore it.
 
 Files such as `github-bootstrap.json`, `github-delta.json`, and
 `github-reconciliation.json` are resumable internal progress. They are not
-complete snapshots and must not be used as briefing evidence.
+complete snapshots and must not be used as briefing evidence. They are not
+deleted after completion and contain copies of raw provider items.
+
+Per-item directories (`issues/`, `pulls/`, `merge-requests/`) are never
+pruned: they keep the last fetched data for items that have since been
+closed, merged, deleted, or made inaccessible. Use `index.json` or the
+top-level open lists to decide which items are current. Interrupted atomic
+writes may leave `.forge-sync-*.tmp` files, which consumers must ignore.
 
 ## GitHub layout
 
@@ -104,6 +122,12 @@ issues/<number>/
   events.json
   sync-meta.json
 ```
+
+`events.json` contains the issue **timeline** (`/issues/<number>/timeline`),
+not the plain `/events` list, so it also includes comments, commits, reviews,
+and cross-references (which embed the referencing issue). `sync-meta.json`
+holds the item's `updated_at` and is written last; a bundle without it, or
+with a different timestamp, is refreshed on the next run.
 
 Pull-request details:
 
@@ -152,6 +176,10 @@ merge-requests/<iid>/
   changes.json
   pipeline.json
 ```
+
+GitLab detail bundles have no `sync-meta.json`; a bundle is refreshed when
+any of its files is missing, when the item changed since the cursor, or
+during periodic reconciliation.
 
 GitLab `kind` values are `issue` and `merge-request`. `pipeline.json` is null
 when an MR has no head pipeline. If a referenced pipeline has disappeared or
