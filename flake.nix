@@ -18,6 +18,12 @@
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             FORGE_SYNC_GLAB_PATH = "${pkgs.glab}/bin/glab";
+            # The build sandbox has no system trust store; reqwest's rustls
+            # backend uses the platform verifier, so tests that build a
+            # client need CA roots. Check phase only; not used at runtime.
+            preCheck = ''
+              export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+            '';
           };
         });
 
