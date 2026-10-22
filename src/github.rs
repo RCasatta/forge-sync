@@ -166,6 +166,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_builds() {
+        // Building the rustls client loads the platform trust store; this
+        // must succeed without network access.
+        assert!(GithubClient::new().is_ok());
+    }
+
+    #[test]
     fn policy_is_fixed_read_only_and_anonymous() {
         assert_eq!(
             request_policy(),

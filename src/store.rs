@@ -3,7 +3,6 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -35,7 +34,7 @@ pub struct Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 
@@ -81,7 +80,7 @@ impl Store {
         let path = self.root.join(".forge-sync.lock");
         reject_symlink(&path)?;
         let file = open_with_mode(&path, self.permissions.file)?;
-        file.try_lock_exclusive().map_err(|_| Error::Locked)?;
+        file.try_lock().map_err(|_| Error::Locked)?;
         Ok(Lock { file })
     }
 
