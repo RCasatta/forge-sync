@@ -2,6 +2,7 @@
 name = "forge-sync"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 description = "A secure incremental mirror for forge issue and review metadata"
 

@@ -52,16 +52,24 @@ resumed runs recheck the newest page before continuing their saved page cursor.
 
 The first GitHub synchronization enumerates open items newest first and stores
 its accumulator and next page in `github-bootstrap.json`. A later invocation
-checks for new updates before resuming older pages. Detail bundles have a
-provider timestamp marker written last, so interrupted bundles are safely
-retried while completed bundles are reused. Rate exhaustion leaves the manifest
-`partial` and GitHub stops with two requests remaining.
+checks for new updates before resuming older pages. GitHub detail bundles have
+a provider timestamp marker (`sync-meta.json`) written last, so interrupted
+bundles are safely retried while completed bundles are reused. Rate exhaustion
+leaves the manifest `partial` and GitHub stops with two requests remaining.
 
 Open items are fully reconciled every seven days to catch discussion activity
-which does not update its parent. Reconciliation has its own persistent page and
-item progress. A successful incremental snapshot remains usable while this
-background reconciliation spans multiple rate-limit windows; `status` reports
-whether reconciliation is still in progress.
+which does not update its parent. On GitHub, reconciliation has its own
+persistent page and item progress in `github-reconciliation.json`. A successful
+incremental snapshot remains usable while this background reconciliation spans
+multiple rate-limit windows; `status` reports whether reconciliation is still
+in progress. On GitLab, reconciliation re-fetches every open and changed item's
+details within a single run and has no persistent progress.
+
+GitLab synchronization has no checkpoint files: every run lists all open issues
+and merge requests, plus items updated since the cursor. The first run has no
+cursor, so it lists and fetches details for every issue and merge request in
+the project, including closed and merged ones; expect it to be slow on large
+projects.
 
 GitLab synchronization prints sanitized page and item progress to stderr,
 including the collection name and its final record/page counts. Each
